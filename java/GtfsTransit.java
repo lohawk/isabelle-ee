@@ -154,9 +154,13 @@ public class GtfsTransit {
             DefaultDirectedWeightedGraph<String, DefaultEdge> graph = new DefaultDirectedWeightedGraph<>(DefaultEdge.class);
 
             // Add only transit stops as vertices
+            // Use stop_name as node id when available, fallback to stop_id
             for (String stopId : transitStopIds) {
-                if (!graph.containsVertex(stopId)) {
-                    graph.addVertex(stopId);
+                Stop stop = feed.stops.get(stopId);
+                String nodeName = stop != null && stop.stop_name != null && !stop.stop_name.isEmpty()
+                        ? stop.stop_name : stopId;
+                if (!graph.containsVertex(nodeName)) {
+                    graph.addVertex(nodeName);
                 }
             }
 
@@ -167,18 +171,23 @@ public class GtfsTransit {
                 String toId = parts[2];
                 TimeAggregator ta = entry.getValue();
 
-                if (!graph.containsVertex(fromId)) graph.addVertex(fromId);
-                if (!graph.containsVertex(toId)) graph.addVertex(toId);
-                DefaultEdge edge = graph.addEdge(fromId, toId);
+                Stop fromStop = feed.stops.get(fromId);
+                Stop toStop = feed.stops.get(toId);
+                String fromNode = fromStop != null && fromStop.stop_name != null && !fromStop.stop_name.isEmpty()
+                        ? fromStop.stop_name : fromId;
+                String toNode = toStop != null && toStop.stop_name != null && !toStop.stop_name.isEmpty()
+                        ? toStop.stop_name : toId;
+
+                DefaultEdge edge = graph.addEdge(fromNode, toNode);
                 if (edge != null) {
                     graph.setEdgeWeight(edge, ta.avg());
                 }
             }
 
-            // Export as GraphML
-            GraphMLExporter<String, DefaultEdge> exporter = new GraphMLExporter<>();
+            // Export as GraphML, using stop names as node ids
+            GraphMLExporter<String, DefaultEdge> exporter = new GraphMLExporter<>(
+                vertex -> vertex);
             exporter.setExportEdgeWeights(true);
-            exporter.setExportVertexLabels(true);
             StringWriter writer = new StringWriter();
             exporter.exportGraph(graph, writer);
 
