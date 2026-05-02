@@ -3,14 +3,17 @@ import com.conveyal.gtfs.model.Route;
 import com.conveyal.gtfs.model.Stop;
 import com.conveyal.gtfs.model.Trip;
 import com.conveyal.gtfs.model.StopTime;
+import org.jgrapht.graph.DefaultDirectedWeightedGraph;
+import org.jgrapht.graph.DefaultEdge;
+import org.jgrapht.nio.graphml.GraphMLExporter;
 
 import java.io.File;
+import java.io.StringWriter;
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class GtfsTransit {
 
-    // Aggregation: key = "fromStopId:toStopId", value = list of travel times in minutes
     static class TimeAggregator {
         List<Integer> times = new ArrayList<>();
 
@@ -27,7 +30,9 @@ public class GtfsTransit {
 
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.out.println("Usage: ./run.sh GtfsTransit <gtfs-file.zip>");
+            System.out.println("Usage: ./run.sh GtfsTransit <gtfs-file.zip> [output.graphml]");
+            System.out.println("  Without output file: prints table to console");
+            System.out.println("  With output file: saves GraphML for JGraphT analysis");
             return;
         }
 
@@ -36,6 +41,8 @@ public class GtfsTransit {
             System.out.println("Error: file not found: " + args[0]);
             return;
         }
+
+        String outputFile = args.length > 1 ? args[1] : null;
 
         System.out.println("Loading GTFS feed...");
         GTFSFeed feed;
@@ -65,11 +72,12 @@ public class GtfsTransit {
         }
         System.out.println();
 
-        // Aggregate station-to-station travel times across all trips
+        // Aggregation: key = "routeId||fromStopId||toStopId"
         Map<String, TimeAggregator> agg = new LinkedHashMap<>();
 
         for (Trip trip : feed.trips.values()) {
-            if (!transitRoutes.containsKey(trip.route_id)) continue;
+            String routeId = trip.route_id;
+            if (!transitRoutes.containsKey(routeId)) continue;
 
             Iterable<StopTime> stopTimesIterable = feed.getOrderedStopTimesForTrip(trip.trip_id);
             List<StopTime> stops = new ArrayList<>();
@@ -85,40 +93,107 @@ public class GtfsTransit {
                 int minutes = (to.arrival_time - from.departure_time) / 60;
                 if (minutes < 0) continue;
 
-                String key = from.stop_id + ":" + to.stop_id;
+                String key = routeId + "||" + from.stop_id + "||" + to.stop_id;
                 agg.computeIfAbsent(key, k -> new TimeAggregator()).add(minutes);
             }
         }
 
-        // Build stop name lookup
+        // Build stop name lookup (only for transit routes)
+        Set<String> transitStopIds = new HashSet<>();
         Map<String, String> stopNames = new HashMap<>();
-        for (var entry : feed.stops.entrySet()) {
-            Stop stop = entry.getValue();
-            stopNames.put(entry.getKey(), stop.stop_name);
+        for (Trip trip : feed.trips.values()) {
+            if (!transitRoutes.containsKey(trip.route_id)) continue;
+            Iterable<StopTime> stopTimesIterable = feed.getOrderedStopTimesForTrip(trip.trip_id);
+            for (StopTime st : stopTimesIterable) {
+                transitStopIds.add(st.stop_id);
+            }
+        }
+        for (String stopId : transitStopIds) {
+            Stop stop = feed.stops.get(stopId);
+            if (stop != null) {
+                stopNames.put(stopId, stop.stop_name);
+            }
         }
 
-        // Output all unique station-to-station pairs sorted by average time
+        // Console output (table)
         System.out.println("=== Station-to-Station Travel Times ===\n");
         System.out.println("(avg min | range | count = number of trips this pair appears on)\n");
 
-        // Sort pairs by average time
         List<Map.Entry<String, TimeAggregator>> sorted = agg.entrySet().stream()
                 .sorted(Map.Entry.comparingByValue(Comparator.comparingDouble(TimeAggregator::avg)))
                 .toList();
 
-        System.out.printf("  %-25s -> %-25s %s%n", "From", "To", "Avg | Range | Count");
-        System.out.println("  " + "-".repeat(85));
+        System.out.printf("  %-8s %-25s -> %-25s %s%n", "Route", "From", "To", "Avg | Range | Count");
+        System.out.println("  " + "-".repeat(110));
 
         for (var entry : sorted) {
-            String[] parts = entry.getKey().split(":");
-            String fromName = stopNames.getOrDefault(parts[0], parts[0]);
-            String toName = stopNames.getOrDefault(parts[1], parts[1]);
+            String[] parts = entry.getKey().split("\\|\\|", 3);
+            String routeId = parts[0];
+            String fromId = parts[1];
+            String toId = parts[2];
+            String routeName = transitRoutes.getOrDefault(routeId, new Route()).route_short_name;
+            String fromName = stopNames.get(fromId);
+            String toName = stopNames.get(toId);
+            if ((fromName == null || fromName.isEmpty())) {
+                fromName = fromId.substring(fromId.lastIndexOf(':') + 1);
+            }
+            if ((toName == null || toName.isEmpty())) {
+                toName = toId.substring(toId.lastIndexOf(':') + 1);
+            }
+            if (fromName == null || fromName.isEmpty()) fromName = fromId;
+            if (toName == null || toName.isEmpty()) toName = toId;
             TimeAggregator ta = entry.getValue();
-            System.out.printf("  %-25s -> %-25s %.1f | %d-%d | %d%n",
-                    fromName, toName, ta.avg(), ta.min(), ta.max(), ta.count());
+            System.out.printf("  %-8s %-25s -> %-25s %.1f | %d-%d | %d%n",
+                    routeName, fromName, toName, ta.avg(), ta.min(), ta.max(), ta.count());
         }
 
         System.out.println("\nTotal unique pairs: " + agg.size());
+
+        // GraphML export
+        if (outputFile != null) {
+            DefaultDirectedWeightedGraph<String, DefaultEdge> graph = new DefaultDirectedWeightedGraph<>(DefaultEdge.class);
+
+            // Add only transit stops as vertices
+            for (String stopId : transitStopIds) {
+                if (!graph.containsVertex(stopId)) {
+                    graph.addVertex(stopId);
+                }
+            }
+
+            // Add edges with weights
+            for (var entry : agg.entrySet()) {
+                String[] parts = entry.getKey().split("\\|\\|", 3);
+                String fromId = parts[1];
+                String toId = parts[2];
+                TimeAggregator ta = entry.getValue();
+
+                if (!graph.containsVertex(fromId)) graph.addVertex(fromId);
+                if (!graph.containsVertex(toId)) graph.addVertex(toId);
+                DefaultEdge edge = graph.addEdge(fromId, toId);
+                if (edge != null) {
+                    graph.setEdgeWeight(edge, ta.avg());
+                }
+            }
+
+            // Export as GraphML
+            GraphMLExporter<String, DefaultEdge> exporter = new GraphMLExporter<>();
+            exporter.setExportEdgeWeights(true);
+            exporter.setExportVertexLabels(true);
+            StringWriter writer = new StringWriter();
+            exporter.exportGraph(graph, writer);
+
+            File outFile = new File(outputFile);
+            try {
+                java.nio.file.Files.writeString(outFile.toPath(), writer.toString());
+            } catch (Exception e) {
+                System.out.println("Error writing GraphML: " + e.getMessage());
+                feed.close();
+                return;
+            }
+            System.out.println("\nGraphML saved to: " + outFile.getAbsolutePath());
+            System.out.println("Vertices: " + graph.vertexSet().size());
+            System.out.println("Edges: " + graph.edgeSet().size());
+        }
 
         feed.close();
     }
